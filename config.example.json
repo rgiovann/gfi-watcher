@@ -1,0 +1,9 @@
+{
+  "pollIntervalMinutes": 30,
+  "repositories": [
+    { "repo": "debezium/dbz",     "labels": ["good first issue"] },
+    { "repo": "trinodb/trino",    "labels": ["good first issue"] },
+    { "repo": "questdb/questdb",  "labels": ["Good first issue"] },
+    { "repo": "JabRef/jabref",    "labels": ["good first issue"] }
+  ]
+}
