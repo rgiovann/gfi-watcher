@@ -4,6 +4,7 @@ import java.io.FileDescriptor;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.PrintStream;
+import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.channels.FileChannel;
 import java.nio.channels.FileLock;
@@ -12,7 +13,10 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -23,11 +27,12 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 /**
- * Entry point. Three modes:
+ * Entry point. Four modes:
  * <ul>
  *   <li>(no option) stay in the system tray and check every {@code pollIntervalMinutes};</li>
  *   <li>{@code --once} run one check in the console and exit;</li>
- *   <li>{@code --list} print the issues open right now, without changing what was seen.</li>
+ *   <li>{@code --list} print the issues open right now, without changing what was seen;</li>
+ *   <li>{@code --csv=<file>} write the same issues to a CSV file, without changing what was seen.</li>
  * </ul>
  */
 public final class Main {
@@ -39,11 +44,12 @@ public final class Main {
     private static final Duration SPACING_WITH_TOKEN = Duration.ofMillis(2_100);
 
     private static final String USAGE = """
-            Usage: java -jar gfi-watcher.jar [--once | --list] [--config=<path>]
+            Usage: java -jar gfi-watcher.jar [--once | --list | --csv=<file>] [--config=<path>]
 
               (no option)       stay in the system tray and check periodically
               --once            run one check in the console and exit
               --list            print the issues open right now and exit
+              --csv=<file>      write the issues open right now to a CSV file and exit
               --config=<path>   config file (default: config.json next to the jar,
                                 or in the current directory)
 
@@ -96,13 +102,52 @@ public final class Main {
 
         switch (options.mode()) {
             case LIST -> System.exit(list(config, client, spacing));
+            case CSV -> System.exit(csv(config, client, spacing, options.csvPath()));
             case ONCE -> System.exit(once(config, client, dataDir, spacing));
             case TRAY -> tray(config, client, dataDir, spacing);
         }
     }
 
     private static int list(Config config, IssueSource source, Duration spacing) throws InterruptedException {
-        int failures = 0;
+        List<Lookup> lookups = lookUpOpenIssues(config, source, spacing);
+        for (Lookup lookup : lookups) {
+            System.out.println();
+            if (lookup.error() != null) {
+                System.out.println(lookup.repo() + " [" + lookup.label() + "]: FAILED, " + lookup.error());
+                continue;
+            }
+            System.out.println(lookup.repo() + " [" + lookup.label() + "]: " + lookup.issues().size() + " open, unassigned");
+            lookup.issues().forEach(issue -> ConsoleNotifier.print(System.out, issue));
+        }
+        return failures(lookups) == 0 ? 0 : 1;
+    }
+
+    /** Writes what the repositories that answered returned; the others are reported, not fatal. */
+    private static int csv(Config config, IssueSource source, Duration spacing, Path file) throws InterruptedException {
+        List<Lookup> lookups = lookUpOpenIssues(config, source, spacing);
+        // An issue carrying two watched labels is written once.
+        Map<URI, Issue> issues = new LinkedHashMap<>();
+        for (Lookup lookup : lookups) {
+            if (lookup.error() != null) {
+                LOG.warning(lookup.repo() + " [" + lookup.label() + "] left out: " + lookup.error());
+            } else {
+                lookup.issues().forEach(issue -> issues.putIfAbsent(issue.url(), issue));
+            }
+        }
+        try {
+            CsvExport.write(file, List.copyOf(issues.values()));
+        } catch (IOException e) {
+            LOG.severe("Cannot write " + file.toAbsolutePath() + " (is it open in Excel?): " + e.getMessage());
+            return 2;
+        }
+        System.out.println("Wrote " + issues.size() + " issue(s) to " + file.toAbsolutePath());
+        return failures(lookups) == 0 ? 0 : 1;
+    }
+
+    /** One search per repository and label, each result sorted fewest comments first. */
+    private static List<Lookup> lookUpOpenIssues(Config config, IssueSource source, Duration spacing)
+            throws InterruptedException {
+        List<Lookup> lookups = new ArrayList<>();
         boolean firstRequest = true;
         for (RepositoryWatch watch : config.repositories()) {
             for (String label : watch.labels()) {
@@ -111,20 +156,24 @@ public final class Main {
                 }
                 firstRequest = false;
                 try {
-                    List<Issue> issues = source.findOpenUnassigned(watch.repo(), label);
-                    System.out.println();
-                    System.out.println(watch.repo() + " [" + label + "]: " + issues.size() + " open, unassigned");
-                    issues.stream()
+                    List<Issue> issues = source.findOpenUnassigned(watch.repo(), label).stream()
                             .sorted(Issue.FEWEST_COMMENTS_FIRST)
-                            .forEach(issue -> ConsoleNotifier.print(System.out, issue));
+                            .toList();
+                    lookups.add(new Lookup(watch.repo(), label, issues, null));
                 } catch (IOException e) {
-                    failures++;
-                    System.out.println();
-                    System.out.println(watch.repo() + " [" + label + "]: FAILED, " + e.getMessage());
+                    lookups.add(new Lookup(watch.repo(), label, List.of(), e.getMessage()));
                 }
             }
         }
-        return failures == 0 ? 0 : 1;
+        return lookups;
+    }
+
+    private static long failures(List<Lookup> lookups) {
+        return lookups.stream().filter(lookup -> lookup.error() != null).count();
+    }
+
+    /** The result of one search: its issues, or the error that stopped it. */
+    private record Lookup(String repo, String label, List<Issue> issues, String error) {
     }
 
     private static int once(Config config, IssueSource source, Path dataDir, Duration spacing)
@@ -267,20 +316,32 @@ public final class Main {
         }
     }
 
-    enum Mode { TRAY, ONCE, LIST }
+    enum Mode { TRAY, ONCE, LIST, CSV }
 
-    record Options(Mode mode, Path configPath, boolean help) {
+    record Options(Mode mode, Path configPath, Path csvPath, boolean help) {
 
         static Options parse(String[] args) {
             Mode mode = Mode.TRAY;
             Path config = null;
+            Path csv = null;
             boolean help = false;
             for (String arg : args) {
-                if (arg.equals("--once") || arg.equals("--list")) {
+                Mode requested = switch (arg) {
+                    case "--once" -> Mode.ONCE;
+                    case "--list" -> Mode.LIST;
+                    default -> arg.startsWith("--csv") ? Mode.CSV : null;
+                };
+                if (requested != null) {
                     if (mode != Mode.TRAY) {
-                        throw new IllegalArgumentException("Use only one of --once and --list");
+                        throw new IllegalArgumentException("Use only one of --once, --list and --csv");
                     }
-                    mode = arg.equals("--once") ? Mode.ONCE : Mode.LIST;
+                    mode = requested;
+                    if (requested == Mode.CSV) {
+                        if (!arg.startsWith("--csv=") || arg.length() == "--csv=".length()) {
+                            throw new IllegalArgumentException("--csv needs a file name, e.g. --csv=issues.csv");
+                        }
+                        csv = Path.of(arg.substring("--csv=".length()));
+                    }
                 } else if (arg.startsWith("--config=") && arg.length() > "--config=".length()) {
                     config = Path.of(arg.substring("--config=".length()));
                 } else if (arg.equals("--help") || arg.equals("-h")) {
@@ -289,7 +350,7 @@ public final class Main {
                     throw new IllegalArgumentException("Unknown option: " + arg);
                 }
             }
-            return new Options(mode, config, help);
+            return new Options(mode, config, csv, help);
         }
     }
 }
