@@ -78,11 +78,19 @@ Don't put it in `config.json`.
 
 ```shell
 java -jar target/gfi-watcher.jar --list    # print the issues open right now, fewest comments first (changes nothing)
+java -jar target/gfi-watcher.jar --csv=issues.csv   # write the same issues to a CSV file (changes nothing)
 java -jar target/gfi-watcher.jar --once    # run one check in the console and exit
 java -jar target/gfi-watcher.jar           # stay in the system tray and check periodically
 ```
 
 On Windows, `javaw -jar gfi-watcher.jar` starts the tray mode without a console window.
+
+The CSV file is made for Excel in Portuguese and other locales that separate lists with a
+semicolon: columns are separated by `;`, and it is UTF-8 with a byte order mark, so accented
+letters show correctly when the file is opened with a double click. Columns: `repo`, `label`,
+`number`, `title`, `comments`, `created`, `url`, in the same order as `--list`. Anyone can open
+an issue, so a title starting with `=`, `+`, `-` or `@` gets a leading `'`, which keeps Excel from
+running it as a formula. Close the file in Excel before writing it again: Excel locks open files.
 
 In Git Bash, use forward slashes (`target/gfi-watcher.jar`): a backslash is an escape character
 there. gfi-watcher detects Git Bash and prints in UTF-8, which its terminal expects, so accented
